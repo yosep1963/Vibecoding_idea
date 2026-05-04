@@ -26,8 +26,11 @@ chcp 65001
 ```powershell
 uv run vibe collect      # 최근 GitHub 활동 반영 (~3분)
 uv run vibe analyze      # 임베딩 + 클러스터 갱신 (~5분, GPU 사용)
-uv run vibe recommend    # Claude로 추천 3개 + CLAUDE.md 초안 (~30초, ~$0.1)
+uv run vibe recommend    # Claude Agent SDK로 추천 3개 + CLAUDE.md 초안 (~30초, 구독 사용)
 ```
+
+> Phase 3는 `claude-agent-sdk`를 통해 호출됩니다. **첫 실행 전 1회 `claude setup-token`** 해두면
+> Claude Code Pro/Max 구독 OAuth로 인증되어 별도 API 과금 없이 동작합니다.
 
 `output\<추천명>\CLAUDE.md`가 생성됩니다. 마음에 드는 추천이 있으면
 
@@ -45,7 +48,9 @@ claude          # Claude Code 실행 → CLAUDE.md를 자동 참조하여 바로
 | `uv run vibe stats` | 언어 분포, 최근 push Top 10, README/CLAUDE.md 보유율 |
 | `uv run vibe clusters` | 6개 클러스터별 레포 그룹 (작업 패턴 가시화) |
 | `uv run vibe show <레포명>` | 특정 레포 상세 (예: `vibe show Voice-SOAP`) |
-| `uv run vibe recommend --history` | 과거 추천 기록 (rec_id별) |
+| `uv run vibe recommend --history` | 과거 추천 기록 + 시작 표시(★) |
+| `uv run vibe acted <id> <title>` | 추천 중 실제로 시작한 프로젝트 표시 (예: `vibe acted 3 hepato`) |
+| `uv run vibe acted <id> <title> --undo` | 표시 취소 |
 
 ## 3. 단계별 재실행 옵션
 
@@ -64,12 +69,13 @@ claude          # Claude Code 실행 → CLAUDE.md를 자동 참조하여 바로
 - **주 1회** — `vibe collect` (가벼움, 데이터만 최신화)
 - **월 1회** — `vibe analyze` + `vibe recommend` (새 시각으로 다음 프로젝트 결정)
 - **분기 1회** — `vibe recommend --history` 보고 회고: "내가 추천 받고 실제 만든 게 뭐였지?"
+- **추천 받은 직후/한 달 내** — 마음에 들어 만들기 시작한 게 있다면 `vibe acted <id> <title>` 로 표시. 누적된 데이터가 향후 추천 품질 분석의 ground truth가 됨
 
 ## 5. 추천 품질을 높이는 팁
 
 - `.env`의 GitHub PAT는 만료 전에 갱신 (만료 시 `collect` 단계에서 401)
 - README 안 쓴 레포가 많으면 추천 정확도 떨어짐 — 자주 만지는 레포 5개 정도는 README 1줄이라도 추가하면 임베딩 품질이 확 올라감
-- Claude API 비용은 1회 약 $0.05–0.20. 월 10회 돌려도 $1–2 수준
+- 추천 호출은 Claude Code 구독 한도 안에서 처리 (월 1–2회 실행은 한도에 거의 영향 없음). 추가 API 과금 X
 - 추천이 뻔하다 싶으면 `vibe analyze --rerun` 후 다시 `vibe recommend` — 캐시 무효화로 신선한 결과
 
 ## 6. 트러블슈팅
@@ -82,8 +88,9 @@ claude          # Claude Code 실행 → CLAUDE.md를 자동 참조하여 바로
 | `Ollama 서버 응답 없음` (analyze) | 시작 메뉴에서 Ollama 데스크톱 앱 실행 |
 | `Ollama 모델 'bge-m3' 미설치` | `ollama pull bge-m3` |
 | `Ollama 모델 'qwen2.5:14b' 미설치` | `ollama pull qwen2.5:14b` |
-| `ANTHROPIC_API_KEY 미설정` | `.env`에 `sk-ant-…` 키 입력 |
-| Claude API 한도 초과 | <https://console.anthropic.com/settings/billing> 잔액 확인 |
+| `Claude 인증 없음` (recommend) | `claude setup-token` 1회 실행 (브라우저 OAuth, ~/.claude/.credentials.json 저장) |
+| `recommend` 401/만료 | `claude setup-token` 재실행해 토큰 갱신 |
+| Claude 구독 한도 초과 | Claude Code 화면에서 한도 회복 시간 확인. 임시방편으로 `.env`에 `CLAUDE_CODE_OAUTH_TOKEN=...` 다른 계정 토큰 지정 가능 |
 | 한글 출력 깨짐 | `setup.ps1` 로드 안 됨 — `chcp 65001` + `$env:PYTHONIOENCODING="utf-8"` 확인 |
 
 ## 7. 핵심 산출물 위치
@@ -102,17 +109,17 @@ D:\Claude_Workspace\Vibecoding_idea\vibe-idea-gen\
 코드 수정 후 회귀 확인:
 
 ```powershell
-uv run pytest          # 31개 단위 테스트 (~1초, 외부 호출 없음)
+uv run pytest          # 단위 테스트 (~1초, 외부 호출 없음)
 uv run pytest -v       # 자세한 출력
 uv run pytest tests/test_analyze.py  # 특정 파일만
 ```
 
 테스트 범위:
 - `tests/test_analyze.py` — 임베딩 텍스트 구성, 상태 휴리스틱, BLOB 라운드트립
-- `tests/test_recommend.py` — 빈틈 매트릭스 계산, JSON 추출, 디렉토리명 안전화
+- `tests/test_recommend.py` — 빈틈 매트릭스 계산, 디렉토리명 안전화 (JSON 파싱은 SDK가 Schema 강제하므로 테스트 불필요)
 - `tests/test_cli.py` — CLI 명령 등록 + `--help` 동작
 
-검증 못 하는 것: GitHub/Ollama/Anthropic 실제 응답 → `vibe collect/analyze/recommend` 직접 실행으로 확인.
+검증 못 하는 것: GitHub/Ollama/Claude 실제 응답 → `vibe collect/analyze/recommend` 직접 실행으로 확인.
 
 ## 9. CLI 명령 전체 요약
 
@@ -123,6 +130,7 @@ vibe show <레포명>
 vibe analyze [--rerun] [--k N]
 vibe clusters
 vibe recommend [--history]
+vibe acted <rec_id> <title> [--undo]
 ```
 
 도움말은 `vibe --help` 또는 `vibe <명령> --help`.

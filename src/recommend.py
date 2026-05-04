@@ -1,9 +1,10 @@
-"""Phase 3: 빈틈 분석 + Claude API로 다음 프로젝트 3개 추천 + CLAUDE.md 초안 생성.
+"""Phase 3: 빈틈 분석 + Claude Agent SDK로 다음 프로젝트 3개 추천 + CLAUDE.md 초안 생성.
 
 설계 원칙:
 - 빈틈 분석은 로컬에서 수행 (도메인×형태 매트릭스, 클러스터 통계)
-- Claude API에는 요약본만 전달 (전체 README 보내지 않음 — 보안 + 토큰 절약)
-- 출력 형식 강제: 한줄요약/소요시간/재사용자산/새로배울것/의미
+- Claude에는 요약본만 전달 (전체 README 보내지 않음 — 보안 + 토큰 절약)
+- 출력 형식 강제: JSON Schema (claude-agent-sdk output_format)
+- 인증: Claude Code Pro/Max 구독 OAuth (별도 API 키 불필요)
 """
 from __future__ import annotations
 
@@ -13,11 +14,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import anyio
+from claude_agent_sdk import (
+    ClaudeAgentOptions,
+    ResultMessage,
+    query,
+)
 from rich.console import Console
 
 from .analyze import DOMAINS, FORMS
 from .config import ROOT, config
-from .llm import USER_CONTEXT, get_anthropic_client
+from .llm import USER_CONTEXT
 from .models import Analysis, Recommendation, Repo, get_session, init_db
 
 console = Console()
@@ -25,6 +32,51 @@ console = Console()
 # Sonnet 4.6 — 추천 품질이 결정적이므로 여기서만 사용
 RECOMMEND_MODEL = "claude-sonnet-4-6"
 OUTPUT_DIR = ROOT / "output"
+
+# JSON Schema — Claude 응답을 강제 검증
+RECOMMENDATION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "recommendations": {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 3,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "maxLength": 25},
+                    "summary": {"type": "string", "maxLength": 80},
+                    "domain": {
+                        "type": "string",
+                        "enum": ["임상AI", "풀스택웹앱", "인프라도구", "학습용", "취미"],
+                    },
+                    "form": {
+                        "type": "string",
+                        "enum": ["웹앱", "CLI", "라이브러리", "PWA", "노트북"],
+                    },
+                    "duration": {
+                        "type": "string",
+                        "enum": ["주말", "1-2주", "1개월+"],
+                    },
+                    "reuse": {"type": "string"},
+                    "learn": {"type": "string"},
+                    "why": {"type": "string"},
+                    "first_steps": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 3,
+                        "maxItems": 3,
+                    },
+                },
+                "required": [
+                    "title", "summary", "domain", "form", "duration",
+                    "reuse", "learn", "why", "first_steps",
+                ],
+            },
+        },
+    },
+    "required": ["recommendations"],
+}
 
 
 def build_repo_summary(repos_with_analysis: list[tuple[Repo, Analysis]]) -> dict[str, Any]:
@@ -192,33 +244,46 @@ def safe_dirname(name: str) -> str:
     return re.sub(r'[<>:"/\\|?*\s]+', '_', name).strip('_')[:60]
 
 
-def extract_json(text: str) -> dict[str, Any]:
-    """Claude 응답 텍스트에서 JSON 객체 추출. ```json ``` 래퍼/raw 모두 처리."""
-    m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if m:
-        return json.loads(m.group(1))
-    m = re.search(r"(\{.*\})", text, re.DOTALL)
-    if m:
-        return json.loads(m.group(1))
-    return json.loads(text)
+async def _query_claude_async(prompt: str) -> tuple[dict[str, Any], float]:
+    """claude-agent-sdk로 단발성 호출 → (structured_output, total_cost_usd)."""
+    options = ClaudeAgentOptions(
+        model=RECOMMEND_MODEL,
+        system_prompt=USER_CONTEXT
+        + "\n너는 위 사용자의 GitHub 활동 패턴을 분석하는 메타 도구다.",
+        # output_format 사용 시 SDK가 내부 검증/재시도를 위해 2–3턴 소비.
+        # max_turns=1은 "Reached maximum number of turns" 에러 → 여유 있게 5.
+        max_turns=5,
+        allowed_tools=[],  # 도구 사용 차단 → 순수 분석/응답만
+        output_format={"type": "json_schema", "schema": RECOMMENDATION_SCHEMA},
+    )
+    structured: dict[str, Any] | None = None
+    cost = 0.0
+    async for msg in query(prompt=prompt, options=options):
+        if isinstance(msg, ResultMessage):
+            structured = getattr(msg, "structured_output", None)
+            cost = getattr(msg, "total_cost_usd", 0.0) or 0.0
+    if structured is None:
+        raise RuntimeError(
+            "Claude Agent SDK가 structured_output을 반환하지 않음. "
+            "JSON Schema 검증 실패 가능. 프롬프트/스키마 확인 필요."
+        )
+    return structured, cost
 
 
 def call_claude(prompt: str) -> dict[str, Any]:
-    """Claude API 호출 → JSON 파싱."""
-    client = get_anthropic_client()
-    resp = client.messages.create(
-        model=RECOMMEND_MODEL,
-        max_tokens=4096,
-        system=USER_CONTEXT + "\n너는 위 사용자의 GitHub 활동 패턴을 분석하는 메타 도구다.",
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text = "".join(b.text for b in resp.content if hasattr(b, "text"))
-    return extract_json(text)
+    """동기 래퍼: claude-agent-sdk 호출 + 비용 표시."""
+    result, cost = anyio.run(_query_claude_async, prompt)
+    if cost > 0:
+        console.print(
+            f"[dim]API 호출 비용: ${cost:.4f} "
+            f"(Claude Code 구독 한도 내라면 청구되지 않음)[/dim]"
+        )
+    return result
 
 
 def run_recommend() -> dict[str, Any]:
     """Phase 3 전체 파이프라인."""
-    config.validate(require_anthropic=True)
+    config.validate(require_claude=True)
     init_db()
 
     session = get_session()
@@ -242,7 +307,10 @@ def run_recommend() -> dict[str, Any]:
             f"[cyan]빈 조합: {len(summary['empty_combinations'])}개, "
             f"sparse: {len(summary['sparse_combinations'])}개[/cyan]"
         )
-        console.print(f"[cyan]Claude API ({RECOMMEND_MODEL}) 호출 중...[/cyan]")
+        console.print(
+            f"[cyan]Claude Agent SDK ({RECOMMEND_MODEL}) 호출 중... "
+            f"(구독 OAuth 사용)[/cyan]"
+        )
 
         prompt = build_prompt(summary)
         result = call_claude(prompt)
@@ -302,7 +370,7 @@ def run_recommend() -> dict[str, Any]:
 
 
 def show_recommend_history() -> None:
-    """과거 추천 이력."""
+    """과거 추천 이력 + 실제로 시작한 항목(acted_on) 표시."""
     from rich.table import Table
 
     init_db()
@@ -324,20 +392,104 @@ def show_recommend_history() -> None:
         )
         table.add_column("ID", justify="right")
         table.add_column("생성 시각")
-        table.add_column("추천 제목들")
-        table.add_column("acted_on", justify="right")
+        table.add_column("추천 제목들 (★ = 실제 시작)")
 
+        total_recs = 0
+        total_acted = 0
         for r in recs:
             titles = [
                 rec.get("title", "?")
                 for rec in (r.payload or {}).get("recommendations", [])
             ]
+            acted = set(r.acted_on or [])
+            marked = [
+                f"[bold green]★ {t}[/bold green]" if t in acted else t
+                for t in titles
+            ]
+            total_recs += len(titles)
+            total_acted += len(acted)
             table.add_row(
                 str(r.id),
                 r.generated_at.strftime("%Y-%m-%d %H:%M"),
-                ", ".join(titles)[:80],
-                str(len(r.acted_on or [])),
+                ", ".join(marked),
             )
         console.print(table)
+        if total_recs:
+            ratio = total_acted / total_recs * 100
+            console.print(
+                f"\n[dim]실행률: {total_acted}/{total_recs} ({ratio:.0f}%). "
+                f"[cyan]vibe acted <id> <title>[/cyan] 로 표시 추가[/dim]"
+            )
+    finally:
+        session.close()
+
+
+def _resolve_title(rec_titles: list[str], query: str) -> str:
+    """추천 제목 리스트에서 부분 매칭(case-insensitive). 0개 또는 2개+ 매칭 시 예외."""
+    q = query.strip().lower()
+    matches = [t for t in rec_titles if q in t.lower()]
+    if not matches:
+        raise ValueError(
+            f"'{query}' 에 매칭되는 추천 없음. 가능한 제목: {rec_titles}"
+        )
+    if len(matches) > 1:
+        raise ValueError(
+            f"'{query}' 모호함 ({len(matches)}개 매칭): {matches}. "
+            f"더 긴 부분 문자열로 다시 시도."
+        )
+    return matches[0]
+
+
+def mark_recommendation_acted(
+    rec_id: int, title_query: str, *, undo: bool = False
+) -> None:
+    """추천을 '실제 시작함' 으로 표시 (또는 --undo로 취소).
+
+    title_query는 부분 문자열 매칭 (case-insensitive). 정확히 1개와 매칭되어야 함.
+    """
+    init_db()
+    session = get_session()
+    try:
+        rec = session.query(Recommendation).filter(
+            Recommendation.id == rec_id
+        ).one_or_none()
+        if rec is None:
+            raise RuntimeError(
+                f"rec_id={rec_id} 추천 없음. "
+                f"[cyan]vibe recommend --history[/cyan] 로 ID 확인."
+            )
+
+        rec_titles = [
+            r.get("title", "")
+            for r in (rec.payload or {}).get("recommendations", [])
+        ]
+        matched = _resolve_title(rec_titles, title_query)
+
+        # JSON 컬럼 in-place 변경은 SQLAlchemy가 감지 못 함 → 새 리스트 할당
+        acted_on = list(rec.acted_on or [])
+        if undo:
+            if matched not in acted_on:
+                console.print(
+                    f"[yellow]'{matched}' 는 이미 미표시 상태 (rec_id={rec_id})[/yellow]"
+                )
+                return
+            acted_on.remove(matched)
+            rec.acted_on = acted_on
+            session.commit()
+            console.print(
+                f"[green]✓ 표시 취소: '{matched}' (rec_id={rec_id})[/green]"
+            )
+        else:
+            if matched in acted_on:
+                console.print(
+                    f"[yellow]'{matched}' 는 이미 acted 표시됨 (rec_id={rec_id})[/yellow]"
+                )
+                return
+            acted_on.append(matched)
+            rec.acted_on = acted_on
+            session.commit()
+            console.print(
+                f"[green]✓ '{matched}' 시작함 표시 완료 (rec_id={rec_id})[/green]"
+            )
     finally:
         session.close()

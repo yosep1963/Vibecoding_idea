@@ -1,9 +1,7 @@
 """recommend.py 의 순수 함수들 단위 테스트."""
-import json
-
 import pytest
 
-from src.recommend import build_repo_summary, extract_json, safe_dirname
+from src.recommend import _resolve_title, build_repo_summary, safe_dirname
 from tests.conftest import make_analysis, make_repo
 
 
@@ -37,32 +35,6 @@ def test_safe_dirname_caps_length():
 def test_safe_dirname_keeps_safe_chars():
     result = safe_dirname("hepatox-notebook")
     assert result == "hepatox-notebook"
-
-
-# === extract_json ===
-
-
-def test_extract_json_from_raw_object():
-    text = '{"recommendations": [{"title": "x"}]}'
-    result = extract_json(text)
-    assert result == {"recommendations": [{"title": "x"}]}
-
-
-def test_extract_json_from_markdown_fence():
-    text = '여기 결과:\n```json\n{"recommendations": [{"title": "x"}]}\n```\n끝.'
-    result = extract_json(text)
-    assert result["recommendations"][0]["title"] == "x"
-
-
-def test_extract_json_from_text_with_prefix():
-    text = '아래는 추천입니다.\n{"recommendations": []}\n끝.'
-    result = extract_json(text)
-    assert result == {"recommendations": []}
-
-
-def test_extract_json_invalid_raises():
-    with pytest.raises(json.JSONDecodeError):
-        extract_json("아무런 JSON도 없는 평문 텍스트")
 
 
 # === build_repo_summary ===
@@ -150,3 +122,38 @@ def test_build_repo_summary_sparse_combinations_only_count_one():
     sparse_str = " ".join(summary["sparse_combinations"])
     assert "임상AI+라이브러리" in sparse_str
     assert "풀스택웹앱+웹앱" not in sparse_str
+
+
+# === _resolve_title (Phase 4 acted 표시) ===
+
+
+def test_resolve_title_exact_match():
+    titles = ["hepatoscores-py", "AsterixisNet-Notebook", "hepatology-mcp"]
+    assert _resolve_title(titles, "hepatoscores-py") == "hepatoscores-py"
+
+
+def test_resolve_title_partial_match():
+    titles = ["hepatoscores-py", "AsterixisNet-Notebook", "hepatology-mcp"]
+    assert _resolve_title(titles, "Notebook") == "AsterixisNet-Notebook"
+
+
+def test_resolve_title_case_insensitive():
+    titles = ["hepatoscores-py", "AsterixisNet-Notebook"]
+    assert _resolve_title(titles, "ASTERIXIS") == "AsterixisNet-Notebook"
+
+
+def test_resolve_title_no_match_raises():
+    titles = ["hepatoscores-py", "AsterixisNet-Notebook"]
+    with pytest.raises(ValueError, match="매칭되는 추천 없음"):
+        _resolve_title(titles, "voice-soap")
+
+
+def test_resolve_title_ambiguous_raises():
+    titles = ["hepatoscores-py", "hepatology-mcp", "AsterixisNet-Notebook"]
+    with pytest.raises(ValueError, match="모호함"):
+        _resolve_title(titles, "hepa")  # hepatoscores + hepatology 둘 다 매칭
+
+
+def test_resolve_title_strips_query():
+    titles = ["hepatoscores-py"]
+    assert _resolve_title(titles, "  hepato  ") == "hepatoscores-py"

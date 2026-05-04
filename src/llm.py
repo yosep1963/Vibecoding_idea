@@ -1,7 +1,7 @@
-"""LLM 래퍼: Ollama (로컬, 임베딩+분류) + Anthropic Claude (Phase 3 추천).
+"""LLM 래퍼: Ollama (로컬, 임베딩+분류).
 
 설계 원칙(CLAUDE.md):
-- 로컬 우선. Claude API는 최종 추천에만 호출.
+- 로컬 우선. Phase 3 Claude 호출은 recommend.py가 직접 claude-agent-sdk 사용.
 - 모든 사용자 컨텍스트 주입 프롬프트에는 "간장학 교수" 명시.
 """
 from __future__ import annotations
@@ -84,11 +84,3 @@ class OllamaClient:
             return False
         except Exception:
             return False
-
-
-def get_anthropic_client():
-    """Phase 3에서만 lazy import. Phase 2 사용 시 anthropic 미설정도 OK."""
-    import anthropic
-    if not config.ANTHROPIC_API_KEY:
-        raise ValueError("ANTHROPIC_API_KEY 미설정. .env 확인.")
-    return anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)

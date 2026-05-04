@@ -6,8 +6,9 @@
     uv run vibe show <레포명>        # 특정 레포 상세 보기
     uv run vibe analyze              # Phase 2: 임베딩 + 카테고리 + 클러스터
     uv run vibe clusters             # 클러스터별 레포 출력
-    uv run vibe recommend            # Phase 3: Claude API 추천 3개
+    uv run vibe recommend            # Phase 3: Claude Agent SDK 추천 3개
     uv run vibe recommend --history  # 과거 추천 이력
+    uv run vibe acted <id> <title>   # Phase 4: 추천 중 실제 시작한 것 표시
 """
 from __future__ import annotations
 
@@ -20,7 +21,11 @@ from rich.table import Table
 from .analyze import run_analyze, show_clusters
 from .collect import collect_all
 from .models import Repo, get_session, init_db
-from .recommend import run_recommend, show_recommend_history
+from .recommend import (
+    mark_recommendation_acted,
+    run_recommend,
+    show_recommend_history,
+)
 
 app = typer.Typer(
     help="Vibe Idea Generator - 본인 패턴 기반 다음 프로젝트 추천",
@@ -197,12 +202,36 @@ def recommend(
         False, "--history", help="과거 추천 이력 출력 (생성 안 함)"
     ),
 ):
-    """Phase 3: 빈틈 분석 + Claude API로 다음 프로젝트 3개 추천."""
+    """Phase 3: 빈틈 분석 + Claude Agent SDK로 다음 프로젝트 3개 추천."""
     if history:
         show_recommend_history()
         return
     try:
         run_recommend()
+    except (RuntimeError, ValueError) as e:
+        console.print(f"[bold red]오류:[/bold red] {e}")
+        raise typer.Exit(1)
+
+
+@app.command()
+def acted(
+    rec_id: int = typer.Argument(
+        ..., help="추천 ID (vibe recommend --history 로 확인)"
+    ),
+    title: str = typer.Argument(
+        ..., help="실제로 시작한 추천 제목 (부분 문자열 OK, 예: 'hepato')"
+    ),
+    undo: bool = typer.Option(
+        False, "--undo", help="시작함 표시 취소"
+    ),
+):
+    """Phase 4: 추천 받은 것 중 실제로 만들기 시작한 프로젝트를 표시.
+
+    rec_id 별 acted_on 리스트에 누적 → vibe recommend --history 에서 ★ 표시.
+    이 데이터가 향후 추천 품질 평가의 ground truth가 됨.
+    """
+    try:
+        mark_recommendation_acted(rec_id, title, undo=undo)
     except (RuntimeError, ValueError) as e:
         console.print(f"[bold red]오류:[/bold red] {e}")
         raise typer.Exit(1)
